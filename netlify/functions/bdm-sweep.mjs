@@ -128,4 +128,4 @@ export default async function handler() {
 
 export const config = {
   schedule: "30 6,15 * * *",
-};
+};Timeout=360
