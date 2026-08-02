@@ -1,0 +1,7 @@
+{
+  "name": "ukpc-bdm-agent",
+  "version": "1.0.0",
+  "private": true,
+  "description": "Scheduled twice-daily 11kV/HV lead sweep for UK Power Connections Ltd. Claude searches the live web and emails a digest.",
+  "type": "module"
+}
