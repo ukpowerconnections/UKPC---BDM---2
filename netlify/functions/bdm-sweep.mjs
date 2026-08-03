@@ -1,41 +1,99 @@
-// UKPC BDM sweep — scheduled Netlify function.
-// Runs twice daily (see netlify.toml), asks Claude (with live web search)
-// for fresh 11kV/HV leads near St Albans, and emails the digest via Resend.
-//
-// Required environment variables (set in Netlify → Site settings → Environment variables):
-//   ANTHROPIC_API_KEY  — from console.anthropic.com (billing enabled)
-//   RESEND_API_KEY     — from resend.com (free tier is fine)
-//   DIGEST_TO          — your email address
-//   DIGEST_FROM        — sender address (e.g. onboarding@resend.dev until you verify a domain)
+// UKPC BDM Agent — powered by PlanIt live planning data
+// Queries PlanIt for St Albans planning applications
+// Twice daily: 07:30 and 16:30 UK time
 
-const SWEEP_PROMPT = `You are the business development researcher for UK Power Connections Ltd (UKPC),
-a NERS-accredited Independent Connection Provider (ICP) based in St Albans, AL3 4PQ.
-UKPC designs and BUILDS LV and HV electrical connections and 11kV substations that are
-ADOPTED by a DNO (UK Power Networks / Eastern Power Networks in this region) or an IDNO
-(GTC/Last Mile, Eclipse Power Networks, Vattenfall IDNO, Energy Assets Networks).
-UKPC does not adopt connections itself. Note: UKPC's NERS scope currently covers LV, so
-flag any lead where HV self-delivery would need a scope extension or jointing partner.
+async function getPlanitApplications() {
+  // St Albans, Hertfordshire: 51.7449, -0.3349
+  // Query PlanIt for applications within 20km radius
+  // PlanIt API: https://www.planit.org.uk/api/applics/json
+  
+  try {
+    const url = new URL("https://www.planit.org.uk/api/applics/json");
+    url.searchParams.append("latitude", "51.7449");
+    url.searchParams.append("longitude", "-0.3349");
+    url.searchParams.append("radius", "20"); // km
+    url.searchParams.append("maxresults", "50");
+    url.searchParams.append("sortby", "date_received");
+    url.searchParams.append("sortorder", "descending");
 
-TASK — search the live web NOW and report:
-1. OPEN PUBLIC TENDERS relevant to 11kV/HV substation works, package/GRP substations,
-   ring main units, HV cabling or contestable connections, within Hertfordshire,
-   Bedfordshire, Buckinghamshire or the north London / M25 corridor. Check Contracts
-   Finder (contractsfinder.service.gov.uk), Find a Tender (find-tender.service.gov.uk)
-   and Supply Hertfordshire. Relevant CPV codes: 45315300, 45231400, 31200000, 71323100,
-   09310000. For each live notice: title, buyer, value, DEADLINE, reference, link.
-2. NEW PRIVATE PIPELINE: newly submitted or newly consented planning applications near
-   St Albans needing new 11kV connections — data centres (esp. Maylands/Hemel Hempstead),
-   BESS/solar, logistics (M1 J8 / M25 / A1(M)), 100+ home residential schemes, and any
-   movement on Hemel Garden Communities, the Watford General rebuild, or the London
-   Luton Airport expansion (DCO TR020001).
-3. Flag anything TIME-SENSITIVE (deadline within 3 weeks) at the very top.
+    const res = await fetch(url.toString(), {
+      method: "GET",
+      headers: { "User-Agent": "UKPC-BDM-Agent/1.0" },
+    });
 
-RULES: Only report items you actually found in live search results, with links.
-If a search returns nothing new since yesterday, say so plainly — do not pad.
-Never invent reference numbers, values or deadlines. Keep it under 600 words,
-formatted as a plain-text email digest with clear sections.`;
+    if (!res.ok) {
+      throw new Error(`PlanIt API ${res.status}`);
+    }
 
-async function runClaudeSweep(apiKey) {
+    const data = await res.json();
+    return data.applications || [];
+  } catch (err) {
+    console.error("PlanIt fetch failed:", err.message);
+    return [];
+  }
+}
+
+function filterForHVRelevance(applications) {
+  // Filter for 11kV-relevant schemes
+  const keywords = [
+    "data centre", "data center",
+    "battery", "bess", "energy storage",
+    "logistics", "warehouse", "distribution",
+    "residential", "housing",
+    "substation", "electrical",
+    "industrial",
+  ];
+
+  return applications.filter((app) => {
+    const text = `${app.name || ""} ${app.proposal || ""} ${app.address || ""}`.toLowerCase();
+    return keywords.some((kw) => text.includes(kw));
+  });
+}
+
+async function runClaudeSweepWithPlanit(apiKey, applications) {
+  // Format applications for Claude analysis
+  const appList = applications
+    .slice(0, 15) // Top 15 most recent
+    .map(
+      (app) =>
+        `- **${app.name || "Unknown"}** (Ref: ${app.reference || "N/A"})
+    Location: ${app.address || "Unknown"}
+    Proposal: ${app.proposal || "Not specified"}
+    Submitted: ${app.date_received || "Unknown"}
+    Status: ${app.status || "Unknown"}
+    Applicant: ${app.applicant_name || "Unknown"}`
+    )
+    .join("\n\n");
+
+  const prompt = `You are the business development researcher for UK Power Connections Ltd (UKPC),
+a NERS-accredited Independent Connection Provider based in St Albans, AL3 4PQ.
+
+Below are LIVE planning applications from PlanIt, filtered for the St Albans area and 11kV-relevant schemes
+(data centres, BESS, logistics, residential 100+, substations).
+
+${appList || "No new applications found in the last 24 hours."}
+
+TASK:
+1. For each application, assess HV connection relevance:
+   - Will it need 11kV/HV? (data centres >1MW, BESS >5MW, 100+ homes, logistics >10,000 sqm)
+   - What's the likely connection voltage and scope?
+   
+2. Flag TIME-SENSITIVE items:
+   - Applications with upcoming decision dates
+   - Recent submissions that indicate early-stage pipeline
+
+3. Suggested next action for each:
+   - Who to contact (developer, architect, agent)
+   - Why UKPC is relevant
+   - When to approach (before detailed design, or at planning stage)
+
+4. NERS HV SCOPE FLAG:
+   UKPC's NERS accreditation currently covers LV only. Any lead requiring HV self-delivery (jointing, energisation, HV cable) 
+   needs either a NERS HV scope extension OR a jointing partner. Flag this for every scheme.
+
+Format as an actionable digest. Be concise — Ryan checks this twice daily. 
+If nothing new or relevant, say so plainly.`;
+
   const res = await fetch("https://api.anthropic.com/v1/messages", {
     method: "POST",
     headers: {
@@ -45,9 +103,8 @@ async function runClaudeSweep(apiKey) {
     },
     body: JSON.stringify({
       model: "claude-sonnet-4-6",
-      max_tokens: 4000,
-      messages: [{ role: "user", content: SWEEP_PROMPT }],
-       
+      max_tokens: 2000,
+      messages: [{ role: "user", content: prompt }],
     }),
   });
 
@@ -69,7 +126,11 @@ async function runClaudeSweep(apiKey) {
 
 async function sendDigest({ resendKey, to, from, body }) {
   const now = new Date();
-  const stamp = now.toLocaleString("en-GB", { timeZone: "Europe/London", dateStyle: "medium", timeStyle: "short" });
+  const stamp = now.toLocaleString("en-GB", {
+    timeZone: "Europe/London",
+    dateStyle: "medium",
+    timeStyle: "short",
+  });
 
   const res = await fetch("https://api.resend.com/emails", {
     method: "POST",
@@ -80,8 +141,10 @@ async function sendDigest({ resendKey, to, from, body }) {
     body: JSON.stringify({
       from: `UKPC BDM Agent <${from}>`,
       to: [to],
-      subject: `11kV lead sweep — ${stamp}`,
-      text: body + "\n\n—\nAutomated digest. Verify every reference and deadline before bidding.",
+      subject: `11kV lead sweep — ${stamp} (PlanIt live data)`,
+      text:
+        body +
+        "\n\n—\nLive planning data from PlanIt (planit.org.uk). Verify all reference numbers and deadlines on St Albans planning portal before bidding.",
     }),
   });
 
@@ -107,13 +170,25 @@ export default async function handler() {
   }
 
   try {
-    const digest = await runClaudeSweep(ANTHROPIC_API_KEY);
+    // Step 1: Fetch live applications from PlanIt
+    console.log("Fetching live applications from PlanIt...");
+    const allApps = await getPlanitApplications();
+    console.log(`Found ${allApps.length} applications near St Albans`);
+
+    // Step 2: Filter for HV relevance
+    const hvRelevant = filterForHVRelevance(allApps);
+    console.log(`${hvRelevant.length} are HV-relevant (data centre, BESS, logistics, residential, industrial)`);
+
+    // Step 3: Send to Claude for analysis
+    console.log("Sending to Claude for analysis...");
+    const digest = await runClaudeSweepWithPlanit(ANTHROPIC_API_KEY, hvRelevant);
+
+    // Step 4: Email the digest
     await sendDigest({ resendKey: RESEND_API_KEY, to: DIGEST_TO, from: DIGEST_FROM, body: digest });
-    console.log("Sweep complete, digest emailed.");
+    console.log("PlanIt sweep complete, digest emailed.");
     return new Response("OK");
   } catch (err) {
     console.error("Sweep failed:", err.message);
-    // Try to email the failure so it never fails silently.
     try {
       await sendDigest({
         resendKey: RESEND_API_KEY,
