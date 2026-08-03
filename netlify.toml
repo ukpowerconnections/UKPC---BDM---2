@@ -5,4 +5,4 @@
 # Times are UTC: 06:30 and 15:30 UTC = 07:30 and 16:30 UK time in summer (BST).
 # Adjust the cron below if you want different times.
 [functions."bdm-sweep"]
-  schedule = "16 1,15 * * *"
+  schedule = "30 01,15 * * *"
